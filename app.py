@@ -20,6 +20,16 @@ SKILL_PATH = Path(__file__).parent / ".claude" / "commands" / "jnet-logic.md"
 
 
 # ─────────────────────────────────────────────
+# API key — from Streamlit secrets (production) or sidebar (local dev)
+# ─────────────────────────────────────────────
+def get_api_key() -> str:
+    try:
+        return st.secrets["ANTHROPIC_API_KEY"]
+    except (KeyError, FileNotFoundError):
+        return ""
+
+
+# ─────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────
 
@@ -39,11 +49,6 @@ def parse_excel(file) -> dict[str, pd.DataFrame]:
 
 
 def parse_csv_input(file) -> dict[str, pd.DataFrame]:
-    """
-    For CSV input: a single CSV that contains all three sections
-    separated by a blank line, OR just Inter-Stages data.
-    Falls back to treating the whole file as Inter-Stages.
-    """
     content = file.read().decode("utf-8")
     df = pd.read_csv(io.StringIO(content))
     return {"Inter-Stages": df}
@@ -90,7 +95,7 @@ def call_claude(system_prompt: str, user_message: str, api_key: str, model: str)
             {
                 "type": "text",
                 "text": system_prompt,
-                "cache_control": {"type": "ephemeral"},   # cache the large system prompt
+                "cache_control": {"type": "ephemeral"},
             }
         ],
         messages=[{"role": "user", "content": user_message}],
@@ -120,7 +125,6 @@ def stream_claude(system_prompt: str, user_message: str, api_key: str, model: st
 def clean_csv_text(raw: str) -> str:
     """Strip markdown fences, leading/trailing whitespace, etc."""
     text = raw.strip()
-    # Remove ```csv ... ``` or ``` ... ```
     text = re.sub(r"^```[a-z]*\n?", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\n?```$", "", text)
     return text.strip()
@@ -148,15 +152,22 @@ st.set_page_config(page_title="JNET Logic Compiler", page_icon="🚦", layout="w
 st.title("🚦 JNET Logic Compiler")
 st.caption("Upload a junction skeleton configuration → receive ready-to-use JNET priority logic as CSV.")
 
+# ── Resolve API key ───────────────────────────
+api_key = get_api_key()
+using_secret = bool(api_key)
+
 # ── Sidebar ──────────────────────────────────
 with st.sidebar:
     st.header("⚙️ Settings")
-    api_key = st.text_input("Anthropic API Key", type="password",
-                            help="Your key. All usage is billed to this key.")
+
+    if not using_secret:
+        api_key = st.text_input("Anthropic API Key", type="password",
+                                help="Your key. All usage is billed to this key.")
+
     model = st.selectbox(
         "Model",
         ["claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5-20251001"],
-        help="Sonnet is the best balance of quality and cost (~$0.35/run).",
+        help="Sonnet is the best balance of quality and cost.",
     )
     use_streaming = st.toggle("Stream output", value=True,
                                help="Show output as it is generated.")
@@ -166,11 +177,10 @@ with st.sidebar:
     st.markdown("- Opus: ~$0.80–1.50")
     st.markdown("- Haiku: ~$0.02–0.05")
     st.divider()
-    st.markdown("Skill file: `.claude/commands/jnet-logic.md`")
     if SKILL_PATH.exists():
         st.success("Skill file found ✓")
     else:
-        st.error("Skill file not found! Run from the project folder.")
+        st.error("Skill file not found!")
 
 # ── Main content ─────────────────────────────
 uploaded_file = st.file_uploader(
@@ -219,7 +229,7 @@ if not api_key:
     st.stop()
 
 if not SKILL_PATH.exists():
-    st.error(f"Skill file not found at `{SKILL_PATH}`. Run the app from the project folder.")
+    st.error(f"Skill file not found at `{SKILL_PATH}`.")
     st.stop()
 
 # ── Compile button ────────────────────────────
@@ -244,7 +254,6 @@ if st.button("🔧 Compile JNET Logic", type="primary", use_container_width=True
         st.subheader("📤 Raw API Output")
 
         if use_streaming:
-            # Stream into a text area and collect full text
             collected = []
             output_placeholder = st.empty()
 
@@ -276,7 +285,7 @@ if st.button("🔧 Compile JNET Logic", type="primary", use_container_width=True
         with col1:
             st.download_button(
                 "⬇️ Download CSV",
-                data=("\ufeff" + csv_text).encode("utf-8"),   # UTF-8 BOM for Excel
+                data=("\ufeff" + csv_text).encode("utf-8"),
                 file_name=csv_filename,
                 mime="text/csv",
                 use_container_width=True,
@@ -290,10 +299,10 @@ if st.button("🔧 Compile JNET Logic", type="primary", use_container_width=True
                 use_container_width=True,
             )
 
-        st.success(f"Saved as `{csv_filename}` — click the button above to download.")
+        st.success(f"Done — click above to download `{csv_filename}`.")
 
     except anthropic.AuthenticationError:
-        st.error("Invalid API key. Check your key in the sidebar.")
+        st.error("Invalid API key.")
     except anthropic.RateLimitError:
         st.error("Rate limit hit. Wait a moment and try again.")
     except Exception as exc:

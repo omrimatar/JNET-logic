@@ -1,0 +1,17 @@
+# Keep only the app files — everything else is local reference material
+*
+!.gitignore
+!app.py
+!requirements.txt
+!.claude/
+!.claude/commands/
+!.claude/commands/jnet-logic.md
+
+# Never commit these
+.claude/settings.local.json
+*.xlsx
+*.csv
+*.pdf
+*.docx
+*.bat
+old/

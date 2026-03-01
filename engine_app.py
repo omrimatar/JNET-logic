@@ -72,7 +72,16 @@ def find_longest_cycle(transitions: list, anchor: str) -> list[list[str]]:
     for nb in graph.get(anchor, []):
         dfs(nb, [anchor, nb], {anchor})
 
-    paths.sort(key=len, reverse=True)
+    def _score(path: list[str]) -> tuple[int, int]:
+        # Primary: longest path first (more stages covered).
+        # Secondary: fewest numbered intermediate stages first.
+        # "Numbered" = stage name contains a digit, excluding the anchor
+        # which sits at path[0] and path[-1] and is always expected to have one.
+        intermediates = path[1:-1]
+        numbered = sum(1 for s in intermediates if any(c.isdigit() for c in s))
+        return (-len(path), numbered)
+
+    paths.sort(key=_score)
     return paths
 
 

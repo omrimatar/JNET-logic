@@ -4,12 +4,19 @@ demand.py — Builds the Demand String for each transition.
 Rules (V20.0):
 1. If Target has a detector → IsActive(Det_[Target])
 2. For each higher-priority sibling of Target (same waterfall level, lower sibling_priority
-   number) that is NOT the From (Current) stage → add IsInactive(Det_[Sibling])
+   number) that is NOT the From (Current) stage → add IsInactive(Det_[Sibling]).
+   THIS RULE APPLIES REGARDLESS OF WHETHER THE TARGET ITSELF HAS A DETECTOR.
+   Siblings are enumerated in ascending priority order (priority 1 first, then 2, …)
+   so every higher-priority entry is explicitly accounted for as inactive.
 3. Waterfall: if transitioning exactly ONE level UP (from_level → from_level-1 = target_level),
    add IsInactive for every stage one level BELOW the source (from_level + 1).
 4. Empty → return '' (never write 'true').
 
-NOTE: Waterfall applies even when target has NO detector.
+Example — B, B1, B2 are siblings (priorities 1, 2, 3) with detectors Pc, Phg, none:
+  A → B  : IsActive(Pc)
+  A → B1 : IsActive(Phg) and IsInactive(Pc)
+  A → B2 : IsInactive(Pc) and IsInactive(Phg)   ← no IsActive (B2 has no detector),
+                                                    but sibling checks still required
 """
 
 from __future__ import annotations
@@ -32,7 +39,11 @@ def build_demand(target: str,
     if target_props and target_props.detector:
         parts.append(f"IsActive({target_props.detector})")
 
-        # ── 2. IsInactive for higher-priority siblings ────────────────────────
+    # ── 2. IsInactive for higher-priority siblings ────────────────────────────
+    # Applied regardless of whether the target itself has a detector.
+    # Sorted by ascending sibling_priority so every higher-priority sibling
+    # is explicitly checked as inactive (not implied by command ordering).
+    if target_props:
         target_level    = target_props.waterfall_level
         target_priority = target_props.sibling_priority
 

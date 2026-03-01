@@ -195,7 +195,8 @@ _defaults = dict(
     transitions=[],
     all_stages=[],
     max_skel_options=[],
-    df_routes=pd.DataFrame(),
+    df_to_rest=pd.DataFrame(),   # compact: unique To Stage → Rest of Skeleton
+    df_routes=pd.DataFrame(),    # full: every (From, To, Rest) — derived, not edited
     df_props=pd.DataFrame(),
     v_anchor='',
     lrt_anchor='',
@@ -283,17 +284,28 @@ if st.session_state.steps >= 3:
             va = st.session_state.v_anchor
             la = st.session_state.lrt_anchor
 
-            route_data = []
+            # Build unique To Stage → Rest of Skeleton map.
+            # Rest of skeleton is determined by To Stage alone (From is irrelevant).
+            to_rest_map: dict[str, str] = {}
             for s_from, s_to in sorted(st.session_state.transitions):
-                route_data.append({
-                    "From Stage": s_from,
-                    "To Stage":   s_to,
-                    "Rest of Skeleton": calculate_rest_of_skeleton(
+                if s_to not in to_rest_map:
+                    to_rest_map[s_to] = calculate_rest_of_skeleton(
                         s_from, s_to, final_skel, va, la,
                         st.session_state.transitions,
-                    ),
-                })
-            st.session_state.df_routes = pd.DataFrame(route_data)
+                    )
+
+            # Compact editor table: one row per unique To Stage
+            st.session_state.df_to_rest = pd.DataFrame([
+                {"To Stage": to, "Rest of Skeleton": rest}
+                for to, rest in sorted(to_rest_map.items())
+            ])
+
+            # Full routes table derived from the map (used by the engine)
+            st.session_state.df_routes = pd.DataFrame([
+                {"From Stage": s_from, "To Stage": s_to,
+                 "Rest of Skeleton": to_rest_map[s_to]}
+                for s_from, s_to in sorted(st.session_state.transitions)
+            ])
 
             props_data = [
                 {
@@ -317,24 +329,44 @@ if st.session_state.steps == 4:
     st.divider()
     st.header("4 — Review & Compile")
 
-    # ── Inter-Stages table ────────────────────────────────────────────────────
-    st.subheader("Inter-Stages  ·  Rest of Skeleton")
+    # ── Rest of Skeleton — compact editor (one row per unique To Stage) ──────
+    st.subheader("Rest of Skeleton  ·  by Target Stage")
+    st.markdown(
+        "Each **To Stage** determines the rest of skeleton for all transitions "
+        "that arrive at it. Edit only the rows that say **Check Manually**."
+    )
+
     n_manual = (
-        st.session_state.df_routes["Rest of Skeleton"]
+        st.session_state.df_to_rest["Rest of Skeleton"]
         .str.strip().str.lower().eq("check manually").sum()
     )
     if n_manual:
-        st.warning(f"{n_manual} row(s) need manual review — fix before compiling.")
+        st.warning(f"{n_manual} target stage(s) need manual review — fix before compiling.")
 
-    edited_routes = st.data_editor(
-        st.session_state.df_routes,
+    edited_to_rest = st.data_editor(
+        st.session_state.df_to_rest,
         use_container_width=True,
-        num_rows="dynamic",
-        key="editor_routes",
+        num_rows="fixed",
+        key="editor_to_rest",
         column_config={
-            "Rest of Skeleton": st.column_config.TextColumn(width="large"),
+            "To Stage":         st.column_config.TextColumn(disabled=True),
+            "Rest of Skeleton": st.column_config.TextColumn(
+                width="large",
+                help="Path from this stage back to the nearest Anchor, dash-separated. E.g. B-C-A0",
+            ),
         },
     )
+
+    # Derive full (From, To, Rest) table from the edited map
+    _to_rest_map = dict(zip(edited_to_rest["To Stage"], edited_to_rest["Rest of Skeleton"]))
+    edited_routes = pd.DataFrame([
+        {"From Stage": s_from, "To Stage": s_to,
+         "Rest of Skeleton": _to_rest_map.get(s_to, "Check Manually")}
+        for s_from, s_to in sorted(st.session_state.transitions)
+    ])
+
+    with st.expander(f"Full Inter-Stages table ({len(edited_routes)} rows) — read-only preview"):
+        st.dataframe(edited_routes, use_container_width=True)
 
     st.divider()
 
@@ -364,13 +396,13 @@ if st.session_state.steps == 4:
     # ── Compile ───────────────────────────────────────────────────────────────
     if st.button("🔧 Compile JNET Logic", type="primary", use_container_width=True):
 
-        # Validate: block if any "Check Manually" cells remain
-        bad = edited_routes[
-            edited_routes["Rest of Skeleton"].str.strip().str.lower() == "check manually"
+        # Validate: block if any "Check Manually" cells remain in the compact table
+        bad = edited_to_rest[
+            edited_to_rest["Rest of Skeleton"].str.strip().str.lower() == "check manually"
         ]
         if not bad.empty:
             st.error(
-                f"**{len(bad)} row(s) still say 'Check Manually'** — "
+                f"**{len(bad)} target stage(s) still say 'Check Manually'** — "
                 "correct them before compiling:"
             )
             st.dataframe(bad, use_container_width=True)

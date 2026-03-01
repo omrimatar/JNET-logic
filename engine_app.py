@@ -1,143 +1,429 @@
 """
-engine_app.py — JNET Logic Compiler (Deterministic Engine, No API Key)
-Same UI as app.py but calls the rule-based engine instead of Claude API.
+engine_app.py — JNET Logic Engine (Route Tool + Deterministic Compiler, combined)
+
+Flow:
+  Step 1 → Upload PDFs  → parse transitions & stages
+  Step 2 → Define anchors, find maximum skeleton
+  Step 3 → Confirm skeleton, auto-generate route & stage tables
+  Step 4 → Review / edit tables → Compile → download 4-sheet Excel
 """
 
 import io
 import re
-from pathlib import Path
 
+import pdfplumber
 import streamlit as st
 import pandas as pd
 
+from engine.config import is_lrt, is_lig
 from engine.parser import parse_excel
 from engine.compiler import compile_junction
 
 
-def derive_junction_name(filename: str) -> str:
-    stem = Path(filename).stem
-    match = re.search(r"[A-Z]{2}\d{2}", stem)
-    return match.group(0) if match else re.sub(r"[^\w]", "_", stem)
+# ══════════════════════════════════════════════════════════════════════════════
+# ROUTE LOGIC HELPERS  (ported from route_app.py)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def parse_interstages_pdf(pdf_file) -> tuple[list, list]:
+    transitions: set[tuple[str, str]] = set()
+    all_stages: set[str] = set()
+    with pdfplumber.open(pdf_file) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text()
+            if not text:
+                continue
+            for line in text.split('\n'):
+                m = re.search(r"([a-zA-Z0-9]+)->([a-zA-Z0-9]+)", line)
+                if m:
+                    s_from, s_to = m.group(1), m.group(2)
+                    transitions.add((s_from, s_to))
+                    all_stages.add(s_from)
+                    all_stages.add(s_to)
+    return list(transitions), sorted(all_stages)
 
 
-def rows_to_csv(rows: list[dict]) -> str:
-    output = io.StringIO()
-    import csv
-    writer = csv.DictWriter(
-        output,
-        fieldnames=['#', 'From', 'To', 'Template', 'JNET Logic Code'],
-        quoting=csv.QUOTE_MINIMAL,
-    )
-    writer.writeheader()
-    writer.writerows(rows)
-    return output.getvalue()
+def find_longest_cycle(transitions: list, anchor: str) -> list[list[str]]:
+    """DFS to find all simple cycles through anchor (vehicle stages only)."""
+    graph: dict[str, list[str]] = {}
+    valid_nodes: set[str] = set()
+    for s_from, s_to in transitions:
+        if is_lrt(s_from) or is_lig(s_from) or is_lrt(s_to) or is_lig(s_to):
+            continue
+        graph.setdefault(s_from, []).append(s_to)
+        valid_nodes.add(s_from)
+        valid_nodes.add(s_to)
+
+    if anchor not in valid_nodes:
+        return []
+
+    paths: list[list[str]] = []
+
+    def dfs(node: str, path: list[str], visited: set[str]) -> None:
+        if node == anchor and len(path) > 1:
+            paths.append(list(path))
+            return
+        if node in visited or node not in graph:
+            return
+        visited.add(node)
+        for nb in graph[node]:
+            dfs(nb, path + [nb], visited)
+        visited.remove(node)
+
+    for nb in graph.get(anchor, []):
+        dfs(nb, [anchor, nb], {anchor})
+
+    paths.sort(key=len, reverse=True)
+    return paths
 
 
-# ── UI ─────────────────────────────────────────────────────────────────────────
+def calculate_rest_of_skeleton(
+    s_from: str, s_to: str,
+    max_skeleton: list[str],
+    v_anchor: str, lrt_anchor: str,
+    all_transitions: list[tuple[str, str]],
+) -> str:
+    def get_suffix(stage: str) -> str | None:
+        if stage not in max_skeleton:
+            return None
+        idx = max_skeleton.index(stage)
+        return "-".join(max_skeleton[idx:])
+
+    # Rule: To is an anchor → end of skeleton
+    if s_to in (v_anchor, lrt_anchor):
+        return "end of skeleton"
+
+    # Special: A01 replaces anchor at start
+    if s_to == "A01":
+        temp = list(max_skeleton)
+        if temp[0] == v_anchor:
+            temp[0] = "A01"
+        return "-".join(temp)
+
+    # To is in max skeleton → return suffix from that point
+    if s_to in max_skeleton:
+        suffix = get_suffix(s_to)
+        if suffix:
+            return suffix
+
+    # To is LRT or Lig → find earliest re-entry into skeleton
+    if is_lrt(s_to) or is_lig(s_to):
+        next_hops = [dest for (src, dest) in all_transitions if src == s_to]
+        valid_hops = [h for h in next_hops if h in max_skeleton]
+        if valid_hops:
+            def sort_key(stage: str) -> int:
+                return len(max_skeleton) if stage == v_anchor else (
+                    max_skeleton.index(stage) if stage in max_skeleton else 999
+                )
+            valid_hops.sort(key=sort_key)
+            best = valid_hops[0]
+            if best == v_anchor:
+                return f"{s_to}-{v_anchor}"
+            suffix = get_suffix(best)
+            return f"{s_to}-{suffix}" if suffix else f"{s_to}-{v_anchor}"
+
+    # Fallback: all next hops lead to anchor
+    next_hops = [dest for (src, dest) in all_transitions if src == s_to]
+    if next_hops and all(d in (v_anchor, lrt_anchor) for d in next_hops):
+        return f"{s_to}-{v_anchor}"
+
+    return "Check Manually"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EXCEL BUILDERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _write_config_sheets(writer: pd.ExcelWriter,
+                         v_anchor: str, lrt_anchor: str, final_skel: list[str],
+                         df_routes: pd.DataFrame, df_props: pd.DataFrame) -> None:
+    """Write the three config sheets into an open ExcelWriter."""
+    info_df = pd.DataFrame({
+        "Parameter": ["Vehicle Anchor", "LRT Anchor", "Maximum Skeleton"],
+        "Value":     [v_anchor, lrt_anchor, " - ".join(final_skel)],
+    })
+    info_df.to_excel(writer, index=False, sheet_name="General Info")
+    df_routes.to_excel(writer, index=False, sheet_name="Inter-Stages")
+    df_props.to_excel(writer, index=False, sheet_name="Stages Properties")
+    for sheet in writer.sheets.values():
+        sheet.set_column(0, 5, 22)
+
+
+def build_config_excel(v_anchor, lrt_anchor, final_skel, df_routes, df_props) -> bytes:
+    """3-sheet skeleton config Excel (used internally to feed the engine)."""
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
+        _write_config_sheets(writer, v_anchor, lrt_anchor, final_skel, df_routes, df_props)
+    return buf.getvalue()
+
+
+def build_output_excel(v_anchor, lrt_anchor, final_skel,
+                       df_routes, df_props, logic_rows: list[dict]) -> bytes:
+    """4-sheet output Excel: config sheets + JNET Logic."""
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
+        _write_config_sheets(writer, v_anchor, lrt_anchor, final_skel, df_routes, df_props)
+        pd.DataFrame(logic_rows).to_excel(writer, index=False, sheet_name="JNET Logic")
+        logic_sheet = writer.sheets["JNET Logic"]
+        logic_sheet.set_column(0, 3, 16)   # #, From, To, Template
+        logic_sheet.set_column(4, 4, 90)   # JNET Logic Code — wide
+    return buf.getvalue()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# APP
+# ══════════════════════════════════════════════════════════════════════════════
 
 st.set_page_config(page_title="JNET Logic Engine", page_icon="🚦", layout="wide")
-st.title("🚦 JNET Logic Engine (Deterministic)")
+st.title("🚦 JNET Logic Engine")
 st.caption(
-    "Upload a junction skeleton configuration → receive ready-to-use JNET priority logic as CSV. "
-    "**No API key required.**"
+    "Upload inter-stages & skeleton PDFs → define anchors → review routes → "
+    "compile → download Excel with JNET Logic sheet."
 )
 
 with st.sidebar:
     st.header("⚙️ About")
     st.markdown(
-        "This engine encodes all JNET V20.0 template rules directly in Python. "
-        "Results are instant and deterministic."
+        "Encodes all JNET V20.0 template rules (A–G) directly in Python. "
+        "Results are instant and deterministic — no API key required."
     )
     st.divider()
-    st.markdown("**Templates supported:** A B C D E F G")
+    st.markdown("**Output:** 4-sheet Excel  \n`General Info · Inter-Stages · Stages Properties · JNET Logic`")
 
-uploaded_file = st.file_uploader(
-    "Upload Skeleton Configuration",
-    type=["xlsx"],
-    help="Excel file with sheets: General Info, Inter-Stages, Stages Properties",
+# ── Session state defaults ─────────────────────────────────────────────────────
+_defaults = dict(
+    steps=1,
+    transitions=[],
+    all_stages=[],
+    max_skel_options=[],
+    df_routes=pd.DataFrame(),
+    df_props=pd.DataFrame(),
+    v_anchor='',
+    lrt_anchor='',
+    final_skel=[],
+    source_name='junction',
 )
+for k, v in _defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
-if not uploaded_file:
-    with st.expander("📋 Required file format", expanded=True):
-        st.markdown("""
-**Excel file (.xlsx) with 3 sheets:**
 
-| Sheet | Required columns |
-|:------|:----------------|
-| General Info | Parameter, Value (Vehicle Anchor, LRT Anchor, Maximum Skeleton) |
-| Stages Properties | Stage, Minimum Type, Detectors, Waterfall Level, Sibling Priority |
-| Inter-Stages | From Stage, To Stage, Rest of Skeleton |
-        """)
-    st.stop()
+# ══ STEP 1 — Upload PDFs ══════════════════════════════════════════════════════
+st.header("1 — Upload Files")
+c1, c2 = st.columns(2)
+with c1:
+    inter_file = st.file_uploader("Inter-stages (PDF)", type='pdf')
+with c2:
+    skel_file = st.file_uploader("Skeletons (PDF)", type='pdf')
 
-junction_name = derive_junction_name(uploaded_file.name)
-st.info(f"Junction: **{junction_name}** &nbsp;|&nbsp; File: `{uploaded_file.name}`")
+if inter_file and skel_file and st.session_state.steps == 1:
+    if st.button("Parse Files", type="primary"):
+        with st.spinner("Reading PDFs…"):
+            trans, stages = parse_interstages_pdf(inter_file)
+        st.session_state.transitions = trans
+        st.session_state.all_stages = stages
+        # Derive a junction name from the filename (e.g. NZ04 from NZ04_interstages.pdf)
+        m = re.search(r"[A-Z]{2}\d{2}", inter_file.name)
+        st.session_state.source_name = m.group(0) if m else re.sub(r"[^\w]", "_", inter_file.name)
+        st.session_state.steps = 2
+        st.rerun()
 
-# ── Preview ────────────────────────────────────────────────────────────────────
-with st.expander("🔍 Preview input data"):
-    try:
-        cfg_preview = parse_excel(uploaded_file)
-        uploaded_file.seek(0)
-        st.subheader("General Info")
-        st.write({
-            "Vehicle Anchor": cfg_preview.vehicle_anchor,
-            "LRT Anchor": cfg_preview.lrt_anchor,
-            "Max Skeleton": cfg_preview.max_skeleton,
-        })
-        st.subheader("Stages Properties")
-        st.dataframe(
-            pd.DataFrame([vars(p) for p in cfg_preview.stage_props.values()]),
-            use_container_width=True,
+
+# ══ STEP 2 — Anchors ══════════════════════════════════════════════════════════
+if st.session_state.steps >= 2:
+    st.divider()
+    st.header("2 — Define Anchors")
+
+    stages = st.session_state.all_stages
+    def_veh = "A0"  if "A0"  in stages else stages[0]
+    def_lrt = "L39" if "L39" in stages else stages[-1]
+
+    col1, col2 = st.columns(2)
+    with col1:
+        v_anchor = st.selectbox(
+            "Vehicle Anchor", stages,
+            index=stages.index(def_veh) if def_veh in stages else 0,
         )
-        st.subheader("Inter-Stages")
-        st.dataframe(
-            pd.DataFrame([vars(t) for t in cfg_preview.transitions]),
-            use_container_width=True,
+    with col2:
+        lrt_anchor = st.selectbox(
+            "LRT Anchor", stages,
+            index=stages.index(def_lrt) if def_lrt in stages else 0,
         )
-    except Exception as exc:
-        st.error(f"Could not read file: {exc}")
 
-# ── Compile ────────────────────────────────────────────────────────────────────
-if st.button("🔧 Compile JNET Logic", type="primary", use_container_width=True):
-    csv_filename = f"{junction_name}_JNET_Logic_Output.csv"
+    if st.session_state.steps == 2:
+        if st.button("Find Maximum Skeleton", type="primary"):
+            opts = find_longest_cycle(st.session_state.transitions, v_anchor)
+            if not opts:
+                st.error(f"No vehicle cycle found starting from '{v_anchor}'.")
+            else:
+                st.session_state.max_skel_options = opts
+                st.session_state.v_anchor   = v_anchor
+                st.session_state.lrt_anchor = lrt_anchor
+                st.session_state.steps = 3
+                st.rerun()
 
-    try:
-        uploaded_file.seek(0)
-        cfg = parse_excel(uploaded_file)
 
-        with st.spinner("Compiling…"):
-            rows = compile_junction(cfg)
+# ══ STEP 3 — Confirm Skeleton ══════════════════════════════════════════════════
+if st.session_state.steps >= 3:
+    st.divider()
+    st.header("3 — Select Maximum Skeleton")
 
-        df_result = pd.DataFrame(rows)
+    opt_strings = [" - ".join(p) for p in st.session_state.max_skel_options] + ["Manual Entry"]
+    selected = st.radio("Detected cycles (longest first):", opt_strings, horizontal=True)
 
-        st.divider()
-        st.subheader(f"✅ Logic Table — {len(df_result)} transitions")
-        st.dataframe(df_result, use_container_width=True)
+    final_skel: list[str] = []
+    if selected == "Manual Entry":
+        manual = st.text_input("Enter skeleton stages (comma-separated, e.g. A0, B, C, A0)")
+        if manual:
+            final_skel = [s.strip() for s in manual.split(',')]
+    else:
+        final_skel = selected.split(" - ")
 
-        csv_text = rows_to_csv(rows)
+    if final_skel and st.session_state.steps == 3:
+        if st.button("Generate Configuration Tables", type="primary"):
+            va = st.session_state.v_anchor
+            la = st.session_state.lrt_anchor
 
-        col1, col2 = st.columns(2)
-        with col1:
+            route_data = []
+            for s_from, s_to in sorted(st.session_state.transitions):
+                route_data.append({
+                    "From Stage": s_from,
+                    "To Stage":   s_to,
+                    "Rest of Skeleton": calculate_rest_of_skeleton(
+                        s_from, s_to, final_skel, va, la,
+                        st.session_state.transitions,
+                    ),
+                })
+            st.session_state.df_routes = pd.DataFrame(route_data)
+
+            props_data = [
+                {
+                    "Stage": s,
+                    "Minimum Type": "min",
+                    "Detectors": "",
+                    "Waterfall Level": None,
+                    "Sibling Priority": None,
+                }
+                for s in sorted(st.session_state.all_stages)
+                if not is_lrt(s) and not is_lig(s)
+            ]
+            st.session_state.df_props  = pd.DataFrame(props_data)
+            st.session_state.final_skel = final_skel
+            st.session_state.steps = 4
+            st.rerun()
+
+
+# ══ STEP 4 — Review, Edit & Compile ═══════════════════════════════════════════
+if st.session_state.steps == 4:
+    st.divider()
+    st.header("4 — Review & Compile")
+
+    # ── Inter-Stages table ────────────────────────────────────────────────────
+    st.subheader("Inter-Stages  ·  Rest of Skeleton")
+    n_manual = (
+        st.session_state.df_routes["Rest of Skeleton"]
+        .str.strip().str.lower().eq("check manually").sum()
+    )
+    if n_manual:
+        st.warning(f"{n_manual} row(s) need manual review — fix before compiling.")
+
+    edited_routes = st.data_editor(
+        st.session_state.df_routes,
+        use_container_width=True,
+        num_rows="dynamic",
+        key="editor_routes",
+        column_config={
+            "Rest of Skeleton": st.column_config.TextColumn(width="large"),
+        },
+    )
+
+    st.divider()
+
+    # ── Stage Properties table ────────────────────────────────────────────────
+    st.subheader("Stages Properties")
+    st.markdown(
+        "Fill in **Detectors**, **Waterfall Level** (0 = highest), and "
+        "**Sibling Priority** (1 = highest) for each vehicle stage."
+    )
+    edited_props = st.data_editor(
+        st.session_state.df_props,
+        use_container_width=True,
+        key="editor_props",
+        column_config={
+            "Stage":          st.column_config.TextColumn(disabled=True),
+            "Minimum Type":   st.column_config.SelectboxColumn(
+                options=["min", "cpn", "saf"], default="min", required=True,
+            ),
+            "Detectors":      st.column_config.TextColumn(help="e.g.  Pc  or  (D2 or Pa)"),
+            "Waterfall Level": st.column_config.NumberColumn(min_value=0, step=1, help="0 = highest"),
+            "Sibling Priority": st.column_config.NumberColumn(min_value=1, step=1, help="1 = highest"),
+        },
+    )
+
+    st.divider()
+
+    # ── Compile ───────────────────────────────────────────────────────────────
+    if st.button("🔧 Compile JNET Logic", type="primary", use_container_width=True):
+
+        # Validate: block if any "Check Manually" cells remain
+        bad = edited_routes[
+            edited_routes["Rest of Skeleton"].str.strip().str.lower() == "check manually"
+        ]
+        if not bad.empty:
+            st.error(
+                f"**{len(bad)} row(s) still say 'Check Manually'** — "
+                "correct them before compiling:"
+            )
+            st.dataframe(bad, use_container_width=True)
+            st.stop()
+
+        try:
+            # Build in-memory config Excel → feed directly to engine
+            config_bytes = build_config_excel(
+                st.session_state.v_anchor,
+                st.session_state.lrt_anchor,
+                st.session_state.final_skel,
+                edited_routes,
+                edited_props,
+            )
+            cfg = parse_excel(io.BytesIO(config_bytes))
+
+            with st.spinner("Compiling…"):
+                logic_rows = compile_junction(cfg)
+
+            df_logic = pd.DataFrame(logic_rows)
+            st.subheader(f"✅ JNET Logic — {len(df_logic)} transitions")
+            st.dataframe(df_logic, use_container_width=True)
+
+            # Error summary
+            error_rows = [r for r in logic_rows if str(r['JNET Logic Code']).startswith('ERROR')]
+            if error_rows:
+                st.warning(f"{len(error_rows)} row(s) produced errors:")
+                for r in error_rows:
+                    st.code(f"Row {r['#']} ({r['From']}→{r['To']}): {r['JNET Logic Code']}")
+
+            # Build 4-sheet output Excel
+            out_bytes = build_output_excel(
+                st.session_state.v_anchor,
+                st.session_state.lrt_anchor,
+                st.session_state.final_skel,
+                edited_routes,
+                edited_props,
+                logic_rows,
+            )
+            fname = f"{st.session_state.source_name}_JNET.xlsx"
+
             st.download_button(
-                "⬇️ Download CSV",
-                data=("\ufeff" + csv_text).encode("utf-8"),
-                file_name=csv_filename,
-                mime="text/csv",
+                "⬇️ Download Excel (4 sheets — includes JNET Logic)",
+                data=out_bytes,
+                file_name=fname,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
                 use_container_width=True,
             )
 
-        st.success(f"Done — {len(rows)} rows compiled.")
-
-        # ── Error rows ─────────────────────────────────────────────────────────
-        error_rows = [r for r in rows if str(r['JNET Logic Code']).startswith('ERROR')]
-        if error_rows:
-            st.warning(f"{len(error_rows)} row(s) had errors:")
-            for r in error_rows:
-                st.code(f"Row {r['#']} ({r['From']}→{r['To']}): {r['JNET Logic Code']}")
-
-    except ValueError as ve:
-        st.error(f"Topology error: {ve}")
-    except Exception as exc:
-        st.error(f"Unexpected error: {exc}")
-        with st.expander("Full traceback"):
-            st.exception(exc)
+        except ValueError as ve:
+            st.error(f"Topology error: {ve}")
+        except Exception as exc:
+            st.error(f"Unexpected error: {exc}")
+            with st.expander("Full traceback"):
+                st.exception(exc)

@@ -60,7 +60,12 @@ def _transform_expr(expr: str, mode: str) -> str:
         tree = _ast.parse(expr, mode='eval')
     except SyntaxError as e:
         raise ValueError(f"Invalid detector expression '{expr}': {e}") from e
-    return _node_to_jnet(tree.body, mode, parent_is_boolop=False)
+    result = _node_to_jnet(tree.body, mode, parent_is_boolop=False)
+    # Always wrap compound expressions in parens so they are safe to join
+    # with 'and' in demand strings without operator-precedence ambiguity.
+    if isinstance(tree.body, _ast.BoolOp):
+        return f"({result})"
+    return result
 
 
 def _node_to_jnet(node, mode: str, parent_is_boolop: bool) -> str:

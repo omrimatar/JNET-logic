@@ -8,6 +8,10 @@ Rules (V20.0):
    THIS RULE APPLIES REGARDLESS OF WHETHER THE TARGET ITSELF HAS A DETECTOR.
    Siblings are enumerated in ascending priority order (priority 1 first, then 2, …)
    so every higher-priority entry is explicitly accounted for as inactive.
+   EXCEPTION — Redundancy elimination: if the sibling's IsInactive expression is
+   logically always-true given the target's IsActive expression (i.e. any top-level
+   OR-disjunct of the sibling's IsInactive matches a top-level AND-conjunct of the
+   target's IsActive), the check is skipped as it adds no information.
 3. Waterfall: if transitioning exactly ONE level UP (from_level → from_level-1 = target_level),
    add IsInactive for every stage one level BELOW the source (from_level + 1).
 4. Empty → return '' (never write 'true').
@@ -93,6 +97,69 @@ def _node_to_jnet(node, mode: str, parent_is_boolop: bool) -> str:
     raise ValueError(f"Unsupported AST node in detector expression: {_ast.dump(node)}")
 
 
+# ── Redundancy helpers ─────────────────────────────────────────────────────────
+
+def _strip_outer_parens(s: str) -> str:
+    """Remove one layer of matching outer parentheses if they span the whole string."""
+    s = s.strip()
+    if not (s.startswith('(') and s.endswith(')')):
+        return s
+    depth = 0
+    for i, c in enumerate(s):
+        if c == '(':
+            depth += 1
+        elif c == ')':
+            depth -= 1
+        if depth == 0:
+            return s[1:-1] if i == len(s) - 1 else s
+    return s
+
+
+def _split_top_level(expr: str, op: str) -> list[str]:
+    """Split expr by 'op' (' and ' or ' or ') at parenthesis depth 0 only."""
+    parts: list[str] = []
+    depth = 0
+    current: list[str] = []
+    i = 0
+    while i < len(expr):
+        if expr[i] == '(':
+            depth += 1
+            current.append(expr[i])
+            i += 1
+        elif expr[i] == ')':
+            depth -= 1
+            current.append(expr[i])
+            i += 1
+        elif depth == 0 and expr[i:i + len(op)] == op:
+            parts.append(''.join(current).strip())
+            current = []
+            i += len(op)
+        else:
+            current.append(expr[i])
+            i += 1
+    if current:
+        parts.append(''.join(current).strip())
+    return parts
+
+
+def _is_redundant_inactive(sibling_inactive: str, target_active: str) -> bool:
+    """
+    Return True if sibling_inactive is always-true given target_active.
+
+    Detected when any top-level OR-disjunct of sibling_inactive appears verbatim
+    as a top-level AND-conjunct of target_active — meaning target_active already
+    guarantees one clause of the sibling disjunction, making the whole OR true.
+
+    Example:
+      target_active   = '((IsActive(D2) or IsActive(Pa)) and IsInactive(Pb))'
+      sibling_inactive= '((IsInactive(D2) and IsInactive(Pa)) or IsInactive(Pb))'
+      → 'IsInactive(Pb)' is both a conjunct of target and a disjunct of sibling → True
+    """
+    t_conjuncts  = set(_split_top_level(_strip_outer_parens(target_active),   ' and '))
+    s_disjuncts  = set(_split_top_level(_strip_outer_parens(sibling_inactive), ' or '))
+    return bool(t_conjuncts & s_disjuncts)
+
+
 # ── Main demand builder ────────────────────────────────────────────────────────
 
 def build_demand(target: str,
@@ -108,13 +175,17 @@ def build_demand(target: str,
     parts: list[str] = []
 
     # ── 1. IsActive for the target detector ──────────────────────────────────
+    target_active = ''
     if target_props and target_props.detector:
-        parts.append(_transform_expr(target_props.detector, 'active'))
+        target_active = _transform_expr(target_props.detector, 'active')
+        parts.append(target_active)
 
     # ── 2. IsInactive for higher-priority siblings ────────────────────────────
     # Applied regardless of whether the target itself has a detector.
     # Sorted by ascending sibling_priority so every higher-priority sibling
     # is explicitly checked as inactive (not implied by command ordering).
+    # Skipped when the sibling's IsInactive is logically implied by the target's
+    # IsActive (redundancy elimination — see _is_redundant_inactive).
     if target_props:
         target_level    = target_props.waterfall_level
         target_priority = target_props.sibling_priority
@@ -131,7 +202,10 @@ def build_demand(target: str,
                 key=lambda p: p.sibling_priority
             )
             for sib in siblings:
-                parts.append(_transform_expr(sib.detector, 'inactive'))
+                inact = _transform_expr(sib.detector, 'inactive')
+                if target_active and _is_redundant_inactive(inact, target_active):
+                    continue
+                parts.append(inact)
 
     # ── 3. Waterfall (exactly one level up) ───────────────────────────────────
     target_level = target_props.waterfall_level if target_props else None

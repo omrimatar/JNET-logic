@@ -318,8 +318,8 @@ st.caption(
 with st.sidebar:
     st.header("⚙️ About")
     st.markdown(
-        "Encodes all JNET V20.0 template rules (A–G) directly in Python. "
-        "Results are instant and deterministic — no API key required."
+        "Encodes all JNET V20.0 template rules to assist planners in creating "
+        "logic for LRT priority in lexicon Y."
     )
     st.divider()
     st.markdown("**Output:** 4-sheet Excel  \n`General Info · Inter-Stages · Stages Properties · JNET Logic`")

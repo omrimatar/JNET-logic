@@ -142,6 +142,19 @@ def _split_top_level(expr: str, op: str) -> list[str]:
     return parts
 
 
+def _negate_simple_atom(s: str) -> str | None:
+    """
+    Return the JNET negation of a simple IsActive/IsInactive atom.
+    Returns None if s is compound (contains nested structure).
+    """
+    s = s.strip()
+    if s.startswith('IsActive(') and s.endswith(')') and '(' not in s[9:]:
+        return 'IsInactive(' + s[9:]
+    if s.startswith('IsInactive(') and s.endswith(')') and '(' not in s[11:]:
+        return 'IsActive(' + s[11:]
+    return None
+
+
 def _is_redundant_inactive(sibling_inactive: str, target_active: str) -> bool:
     """
     Return True if sibling_inactive is always-true given target_active.
@@ -158,6 +171,42 @@ def _is_redundant_inactive(sibling_inactive: str, target_active: str) -> bool:
     t_conjuncts  = set(_split_top_level(_strip_outer_parens(target_active),   ' and '))
     s_disjuncts  = set(_split_top_level(_strip_outer_parens(sibling_inactive), ' or '))
     return bool(t_conjuncts & s_disjuncts)
+
+
+def _simplify_inactive(sibling_inactive: str, target_active: str) -> str:
+    """
+    Prune always-false disjuncts from sibling_inactive given target_active.
+
+    A simple-atom disjunct D is always-false when its negation is a top-level
+    conjunct of target_active (e.g. target requires IsActive(Pb), so any
+    IsInactive(Pb) disjunct in the sibling expression is impossible).
+
+    After pruning:
+      - Nothing removed       → return original unchanged.
+      - One disjunct remains  → return it bare (no OR wrapper).
+      - Multiple remain       → rejoin with ' or ', wrap in parens.
+    """
+    t_conjuncts = set(_split_top_level(_strip_outer_parens(target_active), ' and '))
+    s_inner     = _strip_outer_parens(sibling_inactive)
+    disjuncts   = _split_top_level(s_inner, ' or ')
+
+    if len(disjuncts) <= 1:
+        return sibling_inactive  # nothing to simplify
+
+    kept = []
+    for d in disjuncts:
+        neg = _negate_simple_atom(d)
+        if neg is not None and neg in t_conjuncts:
+            continue   # always-false given target_active → drop
+        kept.append(d)
+
+    if len(kept) == len(disjuncts) or not kept:
+        return sibling_inactive  # nothing pruned, or all pruned (keep original)
+
+    if len(kept) == 1:
+        return kept[0]
+
+    return '(' + ' or '.join(kept) + ')'
 
 
 # ── Main demand builder ────────────────────────────────────────────────────────
@@ -205,6 +254,8 @@ def build_demand(target: str,
                 inact = _transform_expr(sib.detector, 'inactive')
                 if target_active and _is_redundant_inactive(inact, target_active):
                     continue
+                if target_active:
+                    inact = _simplify_inactive(inact, target_active)
                 parts.append(inact)
 
     # ── 3. Waterfall (exactly one level up) ───────────────────────────────────
